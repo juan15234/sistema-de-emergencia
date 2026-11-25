@@ -158,7 +158,7 @@
   }
 
   /* ---------- Plantillas ---------- */
-  const brand = (dark) => `<div class="brand${dark ? ' dark' : ''}"><span class="brand-mark">P</span><div><strong>Punto Seguro</strong><small>Emergencias Colombia</small></div></div>`;
+  const brand = (dark) => `<div class="brand${dark ? ' dark' : ''}"><span class="brand-mark">P</span><div><strong>SafeLine</strong><small>Emergencias Colombia</small></div></div>`;
   const field = (label, name, type, ph) => `<label class="block"><span class="field-label">${label}</span><input class="input" name="${name}" type="${type}" placeholder="${ph}"></label>`;
   const select = (label, name, ph, opts) => `<label class="block"><span class="field-label">${label}</span><select name="${name}" class="input"><option value="">${ph}</option>${opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></label>`;
   const submit = (label) => `<button class="btn btn-primary btn-block submit" type="submit">${label}</button>`;
