@@ -1,12 +1,19 @@
 /* Punto Seguro — app.js
-   Versión en JavaScript puro del proyecto Next.js + Payload.
-   Sin servidor: usuarios, espacios e incidentes se guardan en localStorage
-   y se sincronizan entre pestañas del mismo navegador. */
+   Conectado a PostgreSQL (Supabase) con sincronización en tiempo real por espacio
+   y respaldo de caché en localStorage. */
 (() => {
   'use strict';
 
+  /* ---------- Configuración de Base de Datos ---------- */
+  // Reemplaza estos dos valores con la URL y la clave pública (anon key) de tu proyecto
+  const SUPABASE_URL = 'https://TU-PROYECTO.supabase.co';
+  const SUPABASE_ANON_KEY = 'TU_SUPABASE_ANON_KEY';
+  const STORAGE_BUCKET = 'incident-lists';
+
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
   /* ---------- Constantes ---------- */
-  const KEY = 'ps:db', SESSION = 'ps:session';
+  const CACHE_KEY = 'ps:cache', SESSION = 'ps:session';
   const TYPES = { fire: 'Incendio', earthquake: 'Sismo', flood: 'Inundación', gas: 'Fuga de gas', medical: 'Emergencia médica', other: 'Otra emergencia' };
   const STAGES = ['classification', 'notify', 'evacuation', 'count', 'assistance', 'search', 'damage', 'complete'];
   const STAGE_IDS = ['classification', 'notify', 'evacuation', 'count', 'injured', 'medical', 'missing', 'rescue', 'found', 'foundInjured', 'foundMedical', 'resume', 'safeZone', 'damage', 'complete', 'assistance', 'search'];
@@ -29,6 +36,7 @@
   const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
   const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
   const missingOf = (c) => Math.max(0, c.expected - c.safe - c.injured);
+
   async function hash(text) {
     const data = 'ps:' + text;
     if (window.crypto && crypto.subtle) {
@@ -38,71 +46,246 @@
     return btoa(unescape(encodeURIComponent(data)));
   }
 
-  /* ---------- Base de datos local ---------- */
-  const blank = () => ({ users: [], spaces: [], incidents: [], updates: [], files: [] });
-  const load = () => { try { return { ...blank(), ...JSON.parse(localStorage.getItem(KEY) || '{}') }; } catch { return blank(); } };
-  let db = load();
-  const persist = () => {
-    try { localStorage.setItem(KEY, JSON.stringify(db)); }
-    catch { S.toast = 'No se pudo guardar: el almacenamiento del navegador está lleno.'; }
+  /* ---------- Mapeo entre columnas SQL (snake_case) y App (camelCase) ---------- */
+  const mapUser = (r) => r && ({
+    id: r.id, spaceId: r.space_id, email: r.email, name: r.name, phone: r.phone, role: r.role,
+  });
+
+  const mapSpace = (r) => r && ({
+    id: r.id, name: r.name, type: r.type, address: r.address, joinCode: r.join_code,
+  });
+
+  const mapIncident = (r) => r && ({
+    id: r.id,
+    spaceId: r.space_id,
+    createdBy: r.created_by,
+    title: r.title,
+    emergencyType: r.emergency_type,
+    fireClass: r.fire_class || '',
+    location: r.location,
+    zone: r.zone || '',
+    status: r.status,
+    stage: r.stage,
+    counts: {
+      expected: num(r.expected_count),
+      safe: num(r.safe_count),
+      injured: num(r.injured_count),
+      missing: num(r.missing_count),
+    },
+    checks: r.checks || {},
+    authorityName: r.authority_name || '',
+    notes: r.notes || '',
+    startedAt: r.started_at,
+    endedAt: r.ended_at || null,
+  });
+
+  const mapFile = (r) => r && ({
+    id: r.id,
+    incidentId: r.incident_id,
+    spaceId: r.space_id,
+    name: r.file_name,
+    size: r.file_size,
+    type: r.mime_type,
+    storagePath: r.storage_path,
+    at: r.created_at,
+  });
+
+  /* ---------- Estado en memoria + Caché local ---------- */
+  const blank = () => ({ user: null, space: null, incidents: [], files: [] });
+  const loadCache = () => { try { return { ...blank(), ...JSON.parse(localStorage.getItem(CACHE_KEY) || '{}') }; } catch { return blank(); } };
+  let db = loadCache();
+
+  const persistCache = () => {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify(db)); }
+    catch { /* almacenamiento lleno */ }
   };
 
-  const S = { mode: 'login', join: false, view: '', activeId: null, creating: false, draft: { type: 'fire', location: '', zone: '' }, toast: '', online: navigator.onLine, listFile: null };
+  const S = {
+    mode: 'login', join: false, view: '', activeId: null, creating: false,
+    draft: { type: 'fire', location: '', zone: '' }, toast: '', online: navigator.onLine, listFile: null,
+  };
   let toastTimer;
+  let realtimeChannel = null;
+
   const flash = (msg) => {
     S.toast = msg; clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { S.toast = ''; render(); }, 4500);
   };
 
-  const me = () => db.users.find((u) => u.id === localStorage.getItem(SESSION));
-  const mySpace = () => { const u = me(); return u && db.spaces.find((s) => s.id === u.spaceId); };
-  const myIncidents = () => { const u = me(); return db.incidents.filter((i) => u && i.spaceId === u.spaceId).sort((a, b) => b.startedAt.localeCompare(a.startedAt)); };
-  const incidentById = (id) => myIncidents().find((i) => i.id === id);
+  const me = () => db.user;
+  const mySpace = () => db.space;
+  const myIncidents = () => [...db.incidents].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  const incidentById = (id) => db.incidents.find((i) => i.id === id);
   const firstActive = () => (myIncidents().find((i) => i.status === 'active') || {}).id || null;
 
-  /* ---------- Operaciones (equivalen a las server actions) ---------- */
-  function record(incidentId, action, detail) {
-    const u = me();
-    db.updates.push({ id: uid(), incidentId, spaceId: u.spaceId, userId: u.id, action, detail, at: new Date().toISOString() });
+  /* ---------- Carga y Tiempo Real desde la Base de Datos ---------- */
+  async function syncSpaceData(userId) {
+    const { data: uRow, error: uErr } = await sb.from('users').select('*').eq('id', userId).maybeSingle();
+    if (uErr || !uRow) {
+      logoutLocal();
+      return false;
+    }
+    db.user = mapUser(uRow);
+
+    const [{ data: spRow }, { data: incRows }, { data: fileRows }] = await Promise.all([
+      sb.from('spaces').select('*').eq('id', uRow.space_id).single(),
+      sb.from('incidents').select('*').eq('space_id', uRow.space_id).order('started_at', { ascending: false }),
+      sb.from('incident_files').select('*').eq('space_id', uRow.space_id).order('created_at', { ascending: false }),
+    ]);
+
+    db.space = mapSpace(spRow);
+    db.incidents = (incRows || []).map(mapIncident);
+    db.files = (fileRows || []).map(mapFile);
+    persistCache();
+    subscribeRealtime(uRow.space_id);
+    return true;
   }
 
-  function createIncident({ type, location, zone }) {
+  function subscribeRealtime(spaceId) {
+    if (realtimeChannel) {
+      sb.removeChannel(realtimeChannel);
+      realtimeChannel = null;
+    }
+    realtimeChannel = sb
+      .channel(`space-live-${spaceId}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'incidents', filter: `space_id=eq.${spaceId}` },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            db.incidents = db.incidents.filter((i) => i.id !== payload.old.id);
+          } else {
+            const incoming = mapIncident(payload.new);
+            const idx = db.incidents.findIndex((i) => i.id === incoming.id);
+            if (idx >= 0) db.incidents[idx] = incoming;
+            else db.incidents.unshift(incoming);
+          }
+          persistCache();
+          render();
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'incident_files', filter: `space_id=eq.${spaceId}` },
+        (payload) => {
+          const incoming = mapFile(payload.new);
+          if (!db.files.some((f) => f.id === incoming.id)) {
+            db.files.unshift(incoming);
+            persistCache();
+            render();
+          }
+        }
+      )
+      .subscribe();
+  }
+
+  /* ---------- Operaciones contra la Base de Datos ---------- */
+  async function record(incidentId, action, detail) {
+    const u = me();
+    if (!u) return;
+    await sb.from('incident_updates').insert({
+      incident_id: incidentId,
+      space_id: u.spaceId,
+      user_id: u.id,
+      action,
+      detail,
+    });
+  }
+
+  async function createIncident({ type, location, zone }) {
     const u = me(); location = location.trim().slice(0, 200);
     if (!u || !TYPES[type] || !location) return null;
     const title = `${type === 'fire' ? 'Incendio' : 'Emergencia'} · ${location.slice(0, 120)}`;
-    const inc = {
-      id: uid(), title, emergencyType: type, location, zone: zone.trim().slice(0, 120), status: 'active', stage: 'classification',
-      startedAt: new Date().toISOString(), spaceId: u.spaceId, createdBy: u.id,
-      counts: { expected: 0, safe: 0, injured: 0, missing: 0 }, checks: {},
-    };
-    db.incidents.push(inc); record(inc.id, 'Emergencia activada', title); persist();
+
+    const { data, error } = await sb
+      .from('incidents')
+      .insert({
+        space_id: u.spaceId,
+        created_by: u.id,
+        title,
+        emergency_type: type,
+        location,
+        zone: zone.trim().slice(0, 120),
+        status: 'active',
+        stage: 'classification',
+        expected_count: 0,
+        safe_count: 0,
+        injured_count: 0,
+        missing_count: 0,
+        checks: {},
+      })
+      .select()
+      .single();
+
+    if (error || !data) return null;
+    const inc = mapIncident(data);
+    if (!db.incidents.some((i) => i.id === inc.id)) db.incidents.unshift(inc);
+    persistCache();
+    await record(inc.id, 'Emergencia activada', title);
     return inc;
   }
 
-  function patchIncident(id, p) {
-    const inc = db.incidents.find((i) => i.id === id); if (!inc) return;
-    if (p.stage && STAGE_IDS.includes(p.stage)) inc.stage = p.stage;
+  async function patchIncident(id, p) {
+    const inc = db.incidents.find((i) => i.id === id);
+    if (!inc) return;
+
+    const dbPatch = {};
+    if (p.stage && STAGE_IDS.includes(p.stage)) {
+      inc.stage = p.stage;
+      dbPatch.stage = p.stage;
+    }
     if (p.status && ['active', 'resolved', 'cancelled'].includes(p.status)) {
       inc.status = p.status;
-      if (p.status !== 'active') inc.endedAt = new Date().toISOString();
+      dbPatch.status = p.status;
+      if (p.status !== 'active') {
+        inc.endedAt = new Date().toISOString();
+        dbPatch.ended_at = inc.endedAt;
+      }
     }
-    if (['A', 'B', 'C'].includes(p.fireClass)) inc.fireClass = p.fireClass;
-    if (p.authorityName !== undefined) inc.authorityName = String(p.authorityName).slice(0, 160);
-    if (p.notes !== undefined) inc.notes = String(p.notes).slice(0, 2000);
+    if (['A', 'B', 'C'].includes(p.fireClass)) {
+      inc.fireClass = p.fireClass;
+      dbPatch.fire_class = p.fireClass;
+    }
+    if (p.authorityName !== undefined) {
+      inc.authorityName = String(p.authorityName).slice(0, 160);
+      dbPatch.authority_name = inc.authorityName;
+    }
+    if (p.notes !== undefined) {
+      inc.notes = String(p.notes).slice(0, 2000);
+      dbPatch.notes = inc.notes;
+    }
     if (p.counts) {
       const expected = num(p.counts.expected), safe = Math.min(expected, num(p.counts.safe));
       const injured = Math.min(expected - safe, num(p.counts.injured));
-      inc.counts = { expected, safe, injured, missing: Math.max(0, expected - safe - injured) };
+      const missing = Math.max(0, expected - safe - injured);
+      inc.counts = { expected, safe, injured, missing };
+      dbPatch.expected_count = expected;
+      dbPatch.safe_count = safe;
+      dbPatch.injured_count = injured;
+      dbPatch.missing_count = missing;
     }
-    if (p.checks) inc.checks = { ...inc.checks, ...p.checks };
-    record(id, p.status === 'cancelled' ? 'Emergencia cancelada' : 'Información actualizada', p.stage ? `Fase: ${p.stage}` : 'Recuento o verificación');
-    persist();
+    if (p.checks) {
+      inc.checks = { ...inc.checks, ...p.checks };
+      dbPatch.checks = inc.checks;
+    }
+
+    persistCache();
+    render();
+
+    const { error } = await sb.from('incidents').update(dbPatch).eq('id', id);
+    if (error) {
+      flash('Error al sincronizar con la base de datos.');
+      render();
+      return;
+    }
+    await record(id, p.status === 'cancelled' ? 'Emergencia cancelada' : 'Información actualizada', p.stage ? `Fase: ${p.stage}` : 'Recuento o verificación');
   }
 
-  function save(patch, msg = 'Cambio guardado') {
+  async function save(patch, msg = 'Cambio guardado') {
     if (!S.activeId) return;
-    patchIncident(S.activeId, patch);
-    flash(msg); render();
+    await patchIncident(S.activeId, patch);
+    flash(msg);
+    render();
   }
 
   async function raiseAlarm(inc) {
@@ -119,41 +302,87 @@
     flash('Alarma local y notificación activadas'); render();
   }
 
-  /* ---------- Autenticación ---------- */
+  /* ---------- Autenticación contra Base de Datos ---------- */
   const text = (d, k, max = 200) => String(d[k] || '').trim().slice(0, max);
+
   async function register(d) {
     const email = text(d, 'email').toLowerCase(), password = text(d, 'password', 100), name = text(d, 'name');
     const phone = text(d, 'phone', 30), role = text(d, 'role', 30);
     if (!email || password.length < 8 || !name || !phone || !role) return 'Completa los campos. La contraseña debe tener al menos 8 caracteres.';
-    if (db.users.some((u) => u.email === email)) return 'No fue posible crear la cuenta. Verifica que el correo no esté registrado.';
-    let space;
+
+    const { data: existing } = await sb.from('users').select('id').eq('email', email).maybeSingle();
+    if (existing) return 'No fue posible crear la cuenta. Verifica que el correo no esté registrado.';
+
+    let spaceRow;
     if (S.join) {
       const code = text(d, 'joinCode', 12).toUpperCase();
-      space = db.spaces.find((s) => s.joinCode === code);
-      if (!space) return 'El código del espacio no existe.';
+      if (!code) return 'Ingresa el código del espacio.';
+      const { data: foundSpace, error: spErr } = await sb.from('spaces').select('*').eq('join_code', code).maybeSingle();
+      if (spErr || !foundSpace) return 'El código del espacio no existe.';
+      spaceRow = foundSpace;
     } else {
       const type = text(d, 'spaceType', 30), spaceName = text(d, 'spaceName'), address = text(d, 'address');
       if (!type || !spaceName || !address) return 'Completa los datos del espacio.';
-      space = { id: uid(), name: spaceName, type, address, joinCode: Math.random().toString(36).slice(2, 8).toUpperCase() };
-      db.spaces.push(space);
+      const joinCode = Math.random().toString(36).slice(2, 8).toUpperCase();
+      const { data: newSpace, error: newSpErr } = await sb
+        .from('spaces')
+        .insert({ name: spaceName, type, address, join_code: joinCode })
+        .select()
+        .single();
+      if (newSpErr || !newSpace) return 'No se pudo crear el espacio en la base de datos.';
+      spaceRow = newSpace;
     }
-    const user = { id: uid(), email, passwordHash: await hash(password), name, phone, role, spaceId: space.id };
-    db.users.push(user); persist();
-    startSession(user);
+
+    const { data: newUser, error: userErr } = await sb
+      .from('users')
+      .insert({
+        space_id: spaceRow.id,
+        email,
+        password_hash: await hash(password),
+        name,
+        phone,
+        role,
+      })
+      .select()
+      .single();
+
+    if (userErr || !newUser) return 'No se pudo registrar el usuario en la base de datos.';
+    await startSession(newUser.id);
     return '';
   }
 
   async function login(d) {
     const email = text(d, 'email').toLowerCase(), passwordHash = await hash(text(d, 'password', 100));
-    const user = db.users.find((u) => u.email === email && u.passwordHash === passwordHash);
-    if (!user) return 'Correo o contraseña incorrectos.';
-    startSession(user);
+    const { data: userRow, error } = await sb
+      .from('users')
+      .select('id')
+      .eq('email', email)
+      .eq('password_hash', passwordHash)
+      .maybeSingle();
+
+    if (error || !userRow) return 'Correo o contraseña incorrectos.';
+    await startSession(userRow.id);
     return '';
   }
 
-  function startSession(user) {
-    localStorage.setItem(SESSION, user.id);
-    S.activeId = firstActive(); S.creating = false;
+  async function startSession(userId) {
+    localStorage.setItem(SESSION, userId);
+    await syncSpaceData(userId);
+    S.activeId = firstActive();
+    S.creating = false;
+    render();
+  }
+
+  function logoutLocal() {
+    localStorage.removeItem(SESSION);
+    localStorage.removeItem(CACHE_KEY);
+    db = blank();
+    if (realtimeChannel) {
+      sb.removeChannel(realtimeChannel);
+      realtimeChannel = null;
+    }
+    S.activeId = null;
+    S.creating = false;
     render();
   }
 
@@ -218,6 +447,7 @@
   }
 
   function dashHTML(u, sp) {
+    if (!sp) return '';
     const all = myIncidents(), active = all.filter((i) => i.status === 'active'), hist = all.filter((i) => i.status !== 'active');
     return `${header(u, false)}<main class="container page">
       <div class="page-head"><div><p class="eyebrow">Centro de control</p><h1>Hola, ${esc(u.name.split(' ')[0])}</h1><p class="sub">${esc(sp.name)} · ${esc(sp.address)}</p></div>
@@ -313,8 +543,8 @@
         <aside class="progress"><p>Progreso</p>${STAGES.map((s, i) => `<div class="step${i < idx ? ' done' : i === idx ? ' now' : ''}"><i>${i < idx ? '✓' : i + 1}</i>${LABELS[s]}</div>`).join('')}</aside>
         <section class="panel"><p class="eyebrow">Paso ${idx + 1} de ${STAGES.length}</p>${stageHTML(inc, c, miss)}${inc.stage === 'count' ? upload : ''}</section>
         <aside class="side"><div class="box"><h2>Recuento en vivo</h2><div class="minis">${mini(c.expected, 'Registradas')}${mini(c.safe, 'A salvo')}${mini(c.injured, 'Heridas')}${mini(miss, 'Faltantes', miss > 0)}</div>
-          <p class="live">Se actualiza en todas las pestañas abiertas de ${esc(sp.name)} en este navegador.</p></div>
-          <div class="status${S.online ? '' : ' off'}">${S.online ? '● Conectado · cambios en vivo' : '● Sin conexión · guardando localmente'}</div></aside>
+          <p class="live">Se actualiza en tiempo real para todos los responsables conectados a ${esc(sp.name)}.</p></div>
+          <div class="status${S.online ? '' : ' off'}">${S.online ? '● Conectado · sincronización en vivo' : '● Sin conexión · mostrando caché local'}</div></aside>
       </main>`;
   }
 
@@ -365,29 +595,69 @@
         S.join = !S.join;
         document.getElementById('join-block').hidden = !S.join; document.getElementById('space-block').hidden = S.join;
         el.textContent = S.join ? 'Crear nuevo' : 'Usar código'; break;
-      case 'logout': localStorage.removeItem(SESSION); S.activeId = null; S.creating = false; render(); break;
+      case 'logout': logoutLocal(); break;
       case 'back': S.activeId = null; render(); break;
       case 'open': S.activeId = el.dataset.id; render(); break;
       case 'new': S.draft = { type: 'fire', location: '', zone: '' }; S.creating = true; render(); break;
       case 'close': S.creating = false; render(); break;
       case 'type': S.draft.type = el.dataset.type; render(); break;
       case 'create': {
-        const created = createIncident(S.draft);
-        if (!created) { flash('Revisa los datos de la emergencia.'); render(); break; }
+        el.disabled = true;
+        const created = await createIncident(S.draft);
+        el.disabled = false;
+        if (!created) { flash('No se pudo activar la emergencia. Revisa los datos o tu conexión.'); render(); break; }
         if ('Notification' in window && Notification.permission === 'granted') new Notification('Emergencia activada', { body: created.title });
         S.creating = false; S.activeId = created.id; flash('Emergencia activada. Las alertas fueron enviadas.'); render(); break;
       }
       case 'alarm': if (inc) raiseAlarm(inc); break;
-      case 'cancel': if (confirm('¿Confirmas que deseas cancelar esta emergencia?')) save({ status: 'cancelled' }, 'Emergencia cancelada'); break;
-      case 'patch': save(JSON.parse(el.dataset.patch)); break;
-      case 'count-next': if (inc) { const c = inc.counts || { expected: 0, safe: 0, injured: 0 }; save({ stage: c.injured > 0 ? 'medical' : missingOf(c) > 0 ? 'rescue' : 'resume' }); } break;
+      case 'cancel': if (confirm('¿Confirmas que deseas cancelar esta emergencia?')) await save({ status: 'cancelled' }, 'Emergencia cancelada'); break;
+      case 'patch': await save(JSON.parse(el.dataset.patch)); break;
+      case 'count-next': if (inc) { const c = inc.counts || { expected: 0, safe: 0, injured: 0 }; await save({ stage: c.injured > 0 ? 'medical' : missingOf(c) > 0 ? 'rescue' : 'resume' }); } break;
       case 'save-list': {
         const f = S.listFile, u = me();
         if (!f || !u) break;
         if (f.size > 8e6) { flash('Selecciona un archivo de máximo 8 MB.'); render(); break; }
-        db.files.push({ id: uid(), incidentId: S.activeId, spaceId: u.spaceId, name: f.name, size: f.size, type: f.type, at: new Date().toISOString() });
-        persist(); S.listFile = null; const input = document.getElementById('list-file'); if (input) input.value = '';
-        flash('Lista registrada: ' + f.name); render(); break;
+
+        el.disabled = true;
+        const storagePath = `${u.spaceId}/${S.activeId}/${uid()}_${f.name}`;
+        const { error: upErr } = await sb.storage.from(STORAGE_BUCKET).upload(storagePath, f);
+        if (upErr) {
+          el.disabled = false;
+          flash('Error al subir el archivo al almacenamiento.');
+          render();
+          break;
+        }
+
+        const { data: fileRow, error: dbErr } = await sb
+          .from('incident_files')
+          .insert({
+            incident_id: S.activeId,
+            space_id: u.spaceId,
+            uploaded_by: u.id,
+            file_name: f.name,
+            file_size: f.size,
+            mime_type: f.type,
+            storage_path: storagePath,
+          })
+          .select()
+          .single();
+
+        el.disabled = false;
+        if (dbErr || !fileRow) {
+          flash('El archivo subió pero no se pudo registrar en la base de datos.');
+          render();
+          break;
+        }
+
+        const mapped = mapFile(fileRow);
+        if (!db.files.some((item) => item.id === mapped.id)) db.files.unshift(mapped);
+        persistCache();
+        S.listFile = null;
+        const input = document.getElementById('list-file');
+        if (input) input.value = '';
+        flash('Lista registrada: ' + f.name);
+        render();
+        break;
       }
     }
   });
@@ -411,13 +681,13 @@
     const create = root.querySelector('[data-action=create]'); if (create) create.disabled = !S.draft.location.trim();
   });
 
-  root.addEventListener('change', (e) => {
+  root.addEventListener('change', async (e) => {
     const t = e.target;
-    if (t.dataset.check) save({ checks: { [t.dataset.check]: t.checked } });
+    if (t.dataset.check) await save({ checks: { [t.dataset.check]: t.checked } });
     else if (t.id === 'list-file') { S.listFile = t.files[0] || null; render(); }
   });
 
-  root.addEventListener('focusout', (e) => {
+  root.addEventListener('focusout', async (e) => {
     const t = e.target, inc = S.activeId && incidentById(S.activeId); if (!inc) return;
     if (t.dataset.count) {
       const v = num(t.value), c = inc.counts || { expected: 0, safe: 0, injured: 0 }, miss = missingOf(c), k = t.dataset.count;
@@ -426,15 +696,31 @@
       if (k === 'expected') counts = { expected: v, injured: c.injured, safe: Math.max(0, v - miss - c.injured) };
       else if (k === 'missing') { const d = Math.min(v, Math.max(0, c.expected - c.injured)); counts = { expected: c.expected, injured: c.injured, safe: Math.max(0, c.expected - d - c.injured) }; }
       else { const inj = Math.min(v, Math.max(0, c.expected - miss)); counts = { expected: c.expected, injured: inj, safe: Math.max(0, c.expected - miss - inj) }; }
-      save({ counts });
-    } else if (t.dataset.field && (inc[t.dataset.field] || '') !== t.value) save({ [t.dataset.field]: t.value });
+      await save({ counts });
+    } else if (t.dataset.field && (inc[t.dataset.field] || '') !== t.value) await save({ [t.dataset.field]: t.value });
   });
 
-  window.addEventListener('storage', (e) => { if (e.key === KEY || e.key === SESSION) { db = load(); render(); } });
-  window.addEventListener('online', () => { S.online = true; render(); });
+  window.addEventListener('online', async () => {
+    S.online = true;
+    const savedUserId = localStorage.getItem(SESSION);
+    if (savedUserId) await syncSpaceData(savedUserId);
+    render();
+  });
   window.addEventListener('offline', () => { S.online = false; render(); });
 
   /* ---------- Inicio ---------- */
-  if (me()) S.activeId = firstActive();
-  render();
+  (async () => {
+    const savedUserId = localStorage.getItem(SESSION);
+    if (savedUserId) {
+      if (db.user && db.user.id === savedUserId) {
+        S.activeId = firstActive();
+        render();
+      }
+      if (navigator.onLine) {
+        const ok = await syncSpaceData(savedUserId);
+        if (ok && !S.activeId) S.activeId = firstActive();
+      }
+    }
+    render();
+  })();
 })();
