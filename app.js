@@ -6,8 +6,8 @@
 
   /* ---------- Configuración de Base de Datos ---------- */
   // Reemplaza estos dos valores con la URL y la clave pública (anon key) de tu proyecto
-  const SUPABASE_URL = 'https://TU-PROYECTO.supabase.co';
-  const SUPABASE_ANON_KEY = 'TU_SUPABASE_ANON_KEY';
+  const SUPABASE_URL = 'https://ovpnlhhiecpvzvyggofz.supabase.co/rest/v1/';
+  const SUPABASE_ANON_KEY = 'sb_publishable_wtM20qbtx08upB4Txy9KOQ_JvJ8n3LK';
   const STORAGE_BUCKET = 'incident-lists';
 
   const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
